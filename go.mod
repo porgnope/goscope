@@ -1,15 +1,15 @@
-module gocrawuz
+module goscope
 
 go 1.25
 
 require (
-	fyne.io/fyne/v2 v2.7.1
 	github.com/chromedp/cdproto v0.0.0-20250803210736-d308e07a266d
 	github.com/chromedp/chromedp v0.14.2
 	golang.org/x/sync v0.18.0
 )
 
 require (
+	fyne.io/fyne/v2 v2.7.1 // indirect
 	fyne.io/systray v1.11.1-0.20250603113521-ca66a66d8b58 // indirect
 	github.com/BurntSushi/toml v1.5.0 // indirect
 	github.com/chromedp/sysutil v1.1.0 // indirect
