@@ -26,17 +26,19 @@ type Result struct {
 }
 
 type Scanner struct {
-	BaseURL    string
-	Threads    int
-	EnableSPA  bool
-	DelayMs    int
-	Verbose    bool
-	Wordlist   []string
-	Baseline   BaselineInfo
-	httpClient *http.Client
-	spaRoutes  []string
-	jsFiles    []string
-	mu         sync.Mutex
+	BaseURL                string
+	Threads                int
+	EnableSPA              bool
+	Verbose                bool
+	EnableResponseAnalysis bool
+	RateLimitMs            int
+	RandomUserAgent        bool
+	Wordlist               []string
+	Baseline               BaselineInfo
+	httpClient             *http.Client
+	spaRoutes              []string
+	jsFiles                []string
+	mu                     sync.Mutex
 }
 
 type BaselineInfo struct {
@@ -45,16 +47,68 @@ type BaselineInfo struct {
 	NotFoundLength int
 	IsSPA          bool
 	SPAMarkers     []string
-	ForbiddenHash  string // Baseline для generic 403 страниц
+	ForbiddenHash  string
 }
 
-func NewScanner(baseURL string, threads int, enableSPA bool, delayMs int, verbose bool) *Scanner {
+// Глобальные скомпилированные regex для производительности
+var (
+	endpointPatterns = []*regexp.Regexp{
+		regexp.MustCompile(`<Route[^>]+path=["']([/a-zA-Z0-9_\-:]+)["']`),
+		regexp.MustCompile(`path:\s*["']([/a-zA-Z0-9_\-:]+)["']`),
+		regexp.MustCompile(`\{\s*path:\s*["']([/a-zA-Z0-9_\-:]+)["']`),
+		regexp.MustCompile(`(?:fetch|axios|http)\s*\(\s*["']([/a-zA-Z0-9_\-/]+)["']`),
+		regexp.MustCompile(`(?:get|post|put|delete|patch)\s*\(\s*["']([/a-zA-Z0-9_\-/]+)["']`),
+		regexp.MustCompile(`["'](?i)(/graphql[/a-zA-Z0-9_\-]*)["']`),
+		regexp.MustCompile(`["'](/api/[a-zA-Z0-9_\-/]+)["']`),
+		regexp.MustCompile(`to:\s*["']([/a-zA-Z0-9_\-]+)["']`),
+		regexp.MustCompile(`href:\s*["']([/a-zA-Z0-9_\-]+)["']`),
+		regexp.MustCompile(`["']([/][a-zA-Z][a-zA-Z0-9_\-/]{2,})["']`),
+	}
+
+	jsFilePatterns = []*regexp.Regexp{
+		regexp.MustCompile(`<script[^>]+src=["']([^"']+)["']`),
+		regexp.MustCompile(`["'](https?://[^"']+\.js)["']`),
+		regexp.MustCompile(`["']([/][^"']+\.js)["']`),
+	}
+
+	paramPattern = regexp.MustCompile(`:[a-zA-Z]+`)
+
+	fileExtensions = map[string]bool{
+		".js": true, ".css": true, ".png": true, ".jpg": true,
+		".ico": true, ".json": true, ".txt": true, ".xml": true,
+		".woff": true, ".ttf": true, ".svg": true, ".jpeg": true,
+		".gif": true, ".webp": true, ".woff2": true, ".eot": true,
+	}
+
+	sensitivePatterns = map[string]*regexp.Regexp{
+		"Google API Key": regexp.MustCompile(`AIza[0-9A-Za-z\\-_]{35}`),
+		"AWS Access Key": regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		"Email":          regexp.MustCompile(`[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`),
+		"Internal IP":    regexp.MustCompile(`\b(?:10|172\.16|192\.168)\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`),
+		"JWT Token":      regexp.MustCompile(`eyJ[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_.+/=]*`),
+	}
+)
+
+var userAgents = []string{
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:107.0) Gecko/20100101 Firefox/107.0",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
+	"Mozilla/5.0 (Linux; Android 10; SM-G950F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.101 Mobile Safari/537.36",
+	"Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+}
+
+func randomUserAgent() string {
+	return userAgents[rand.Intn(len(userAgents))]
+}
+
+func NewScanner(baseURL string, threads int, enableSPA bool, verbose bool, enableAnalysis bool, rateLimitMs int, randomUA bool) *Scanner {
 	return &Scanner{
-		BaseURL:   strings.TrimRight(baseURL, "/"),
-		Threads:   threads,
-		EnableSPA: enableSPA,
-		DelayMs:   delayMs,
-		Verbose:   verbose,
+		BaseURL:                strings.TrimRight(baseURL, "/"),
+		Threads:                threads,
+		EnableSPA:              enableSPA,
+		Verbose:                verbose,
+		EnableResponseAnalysis: enableAnalysis,
+		RateLimitMs:            rateLimitMs,
+		RandomUserAgent:        randomUA,
 		httpClient: &http.Client{
 			Timeout: 15 * time.Second,
 			Transport: &http.Transport{
@@ -118,7 +172,6 @@ func (s *Scanner) loadWordlist(filename string) error {
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		// Фильтруем комментарии и плейсхолдеры
 		if line != "" && !strings.HasPrefix(line, "#") && !strings.Contains(line, "%EXT%") {
 			s.Wordlist = append(s.Wordlist, line)
 		}
@@ -157,20 +210,17 @@ func (s *Scanner) createDefaultWordlist(filename string) error {
 }
 
 func (s *Scanner) getBaseline() error {
-	// Baseline для 404
 	randPath := fmt.Sprintf("/nonexistent-%d-%s", time.Now().Unix(), randString(8))
 	notFoundHash, _, err := s.fetchPage(s.BaseURL + randPath)
 	if err != nil {
 		return fmt.Errorf("failed to fetch 404 baseline: %w", err)
 	}
 
-	// Baseline для homepage
 	homeHash, homeBody, err := s.fetchPage(s.BaseURL)
 	if err != nil {
 		return fmt.Errorf("failed to fetch homepage: %w", err)
 	}
 
-	// Baseline для 403 (критично для точности!)
 	forbiddenHash, _, _ := s.fetchPage(s.BaseURL + "/api/nonexistent-test-" + randString(8))
 
 	isSPA := notFoundHash == homeHash
@@ -320,33 +370,7 @@ func (s *Scanner) extractEndpointsFromJS() error {
 func (s *Scanner) extractEndpoints(content, baseURL string) []string {
 	endpoints := []string{}
 
-	patterns := []*regexp.Regexp{
-		// React Router
-		regexp.MustCompile(`<Route[^>]+path=["']([/a-zA-Z0-9_\-:]+)["']`),
-		regexp.MustCompile(`path:\s*["']([/a-zA-Z0-9_\-:]+)["']`),
-
-		// Vue Router
-		regexp.MustCompile(`\{\s*path:\s*["']([/a-zA-Z0-9_\-:]+)["']`),
-
-		// API endpoints
-		regexp.MustCompile(`(?:fetch|axios|http)\s*\(\s*["']([/a-zA-Z0-9_\-/]+)["']`),
-		regexp.MustCompile(`(?:get|post|put|delete|patch)\s*\(\s*["']([/a-zA-Z0-9_\-/]+)["']`),
-
-		// GraphQL
-		regexp.MustCompile(`["'](?i)(/graphql[/a-zA-Z0-9_\-]*)["']`),
-
-		// REST API
-		regexp.MustCompile(`["'](/api/[a-zA-Z0-9_\-/]+)["']`),
-
-		// Navigation
-		regexp.MustCompile(`to:\s*["']([/a-zA-Z0-9_\-]+)["']`),
-		regexp.MustCompile(`href:\s*["']([/a-zA-Z0-9_\-]+)["']`),
-
-		// Generic paths
-		regexp.MustCompile(`["']([/][a-zA-Z][a-zA-Z0-9_\-/]{2,})["']`),
-	}
-
-	for _, pattern := range patterns {
+	for _, pattern := range endpointPatterns {
 		matches := pattern.FindAllStringSubmatch(content, -1)
 		for _, match := range matches {
 			if len(match) > 1 && match[1] != "" {
@@ -366,27 +390,29 @@ func (s *Scanner) normalizeEndpoint(endpoint string) string {
 		endpoint = "/" + endpoint
 	}
 
-	if strings.HasPrefix(endpoint, "http") {
-		u, err := url.Parse(endpoint)
-		if err != nil {
-			return ""
-		}
-		baseU, _ := url.Parse(s.BaseURL)
-		if u.Host != baseU.Host {
-			return ""
-		}
-		endpoint = u.Path
-	}
-
-	if len(endpoint) < 2 || len(endpoint) > 100 {
+	abs, err := ToAbsoluteURL(endpoint, s.BaseURL)
+	if err != nil || abs == "" {
 		return ""
 	}
 
-	if hasFileExtension(endpoint) {
+	if !IsInScope(abs, s.BaseURL, "/") {
 		return ""
 	}
 
-	if strings.Contains(endpoint, "//") || strings.Contains(endpoint, "\\") {
+	opts := DefaultNormalizeOptions()
+	canonical := CanonicalizeURL(abs, opts)
+
+	u, _ := url.Parse(canonical)
+	if u == nil || len(u.Path) < 2 || len(u.Path) > 100 {
+		return ""
+	}
+
+	// исправил проверку на canonical
+	if hasFileExtension(u.Path) {
+		return ""
+	}
+
+	if strings.Contains(u.Path, "//") || strings.Contains(u.Path, "\\") {
 		return ""
 	}
 
@@ -395,7 +421,7 @@ func (s *Scanner) normalizeEndpoint(endpoint string) string {
 		"/image/", "/video/", "/audio/",
 	}
 	for _, mime := range mimeTypes {
-		if strings.HasPrefix(endpoint, mime) {
+		if strings.HasPrefix(u.Path, mime) {
 			return ""
 		}
 	}
@@ -407,12 +433,12 @@ func (s *Scanner) normalizeEndpoint(endpoint string) string {
 		"/_/service_worker", "/debug/", "conversion", "/ccm/", "/measurement/",
 	}
 	for _, bl := range blacklist {
-		if strings.Contains(endpoint, bl) {
+		if strings.Contains(u.Path, bl) {
 			return ""
 		}
 	}
 
-	parts := strings.Split(strings.Trim(endpoint, "/"), "/")
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
 
 	if len(parts) >= 2 {
 		shortSegments := 0
@@ -449,21 +475,17 @@ func (s *Scanner) normalizeEndpoint(endpoint string) string {
 		}
 	}
 
-	endpoint = regexp.MustCompile(`:[a-zA-Z]+`).ReplaceAllString(endpoint, "test")
+	// исправил на canonical вместо endpoint
+	canonicalPath := paramPattern.ReplaceAllString(u.Path, "test")
+	u.Path = canonicalPath
 
-	return endpoint
+	return u.String()
 }
 
 func (s *Scanner) findAllJSFiles(html string) []string {
 	jsSet := make(map[string]bool)
 
-	patterns := []*regexp.Regexp{
-		regexp.MustCompile(`<script[^>]+src=["']([^"']+)["']`),
-		regexp.MustCompile(`["'](https?://[^"']+\.js)["']`),
-		regexp.MustCompile(`["']([/][^"']+\.js)["']`),
-	}
-
-	for _, pattern := range patterns {
+	for _, pattern := range jsFilePatterns {
 		matches := pattern.FindAllStringSubmatch(html, -1)
 		for _, match := range matches {
 			if len(match) > 1 {
@@ -491,6 +513,8 @@ func (s *Scanner) fuzz() []Result {
 	var mu sync.Mutex
 	found := make(map[string]bool)
 
+	opts := DefaultNormalizeOptions()
+
 	allPaths := make([]string, 0, len(s.Wordlist)+len(s.spaRoutes))
 	allPaths = append(allPaths, s.Wordlist...)
 	allPaths = append(allPaths, s.spaRoutes...)
@@ -508,14 +532,25 @@ func (s *Scanner) fuzz() []Result {
 		eg.Go(func() error {
 			defer func() { <-sem }()
 
-			if s.DelayMs > 0 {
-				time.Sleep(time.Millisecond * time.Duration(s.DelayMs))
+			// Rate limiting + jitter
+			if s.RateLimitMs > 0 {
+				jitter := rand.Intn(s.RateLimitMs/2 + 1)
+				time.Sleep(time.Millisecond * time.Duration(s.RateLimitMs+jitter))
 			}
 
 			if !strings.HasPrefix(path, "/") {
 				path = "/" + path
 			}
 			fullURL := s.BaseURL + path
+
+			canonical := CanonicalizeURL(fullURL, opts)
+
+			mu.Lock()
+			if found[canonical] {
+				mu.Unlock()
+				return nil
+			}
+			mu.Unlock()
 
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
@@ -524,6 +559,13 @@ func (s *Scanner) fuzz() []Result {
 			if err != nil {
 				s.logVerbose("Failed to create request for %s: %v", fullURL, err)
 				return nil
+			}
+
+			// Random User-Agent support
+			if s.RandomUserAgent {
+				req.Header.Set("User-Agent", randomUserAgent())
+			} else {
+				req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; GoCrawUz/1.0)")
 			}
 
 			resp, err := s.httpClient.Do(req)
@@ -542,6 +584,10 @@ func (s *Scanner) fuzz() []Result {
 			status := resp.StatusCode
 			hash := fmt.Sprintf("%x", md5.Sum(body))
 
+			if s.EnableResponseAnalysis {
+				s.analyzeResponse(fullURL, string(body))
+			}
+
 			mu.Lock()
 			completed++
 			progress := float64(completed) / float64(total) * 100
@@ -553,8 +599,8 @@ func (s *Scanner) fuzz() []Result {
 
 			if s.isValid(status, hash, string(body), path) {
 				mu.Lock()
-				if !found[fullURL] {
-					found[fullURL] = true
+				if !found[canonical] {
+					found[canonical] = true
 					isSPARoute := contains(s.spaRoutes, path)
 					results = append(results, Result{
 						URL:        fullURL,
@@ -602,14 +648,11 @@ func (s *Scanner) fetchPage(urlStr string) (string, string, error) {
 }
 
 func (s *Scanner) isValid(status int, hash, body, path string) bool {
-	// 403 - фильтруем generic forbidden pages (критично для точности!)
 	if status == 403 {
-		// Если hash совпадает с baseline 403 - это ложное срабатывание
 		if s.Baseline.ForbiddenHash != "" && hash == s.Baseline.ForbiddenHash {
 			s.logVerbose("Skipping %s - generic 403 page (hash: %s)", path, hash[:10])
 			return false
 		}
-		// Уникальная 403 страница - сохраняем (реальный endpoint)
 		s.logVerbose("Found unique 403: %s (hash: %s)", path, hash[:10])
 		return true
 	}
@@ -641,13 +684,19 @@ func (s *Scanner) isValid(status int, hash, body, path string) bool {
 }
 
 func hasFileExtension(path string) bool {
-	exts := []string{".js", ".css", ".png", ".jpg", ".ico", ".json", ".txt", ".xml", ".woff", ".ttf", ".svg"}
-	for _, ext := range exts {
-		if strings.HasSuffix(path, ext) {
-			return true
-		}
+	// Получаем расширение
+	lastDot := strings.LastIndex(path, ".")
+	if lastDot == -1 {
+		return false
 	}
-	return false
+
+	ext := strings.ToLower(path[lastDot:])
+	// Казним query если будет
+	if idx := strings.Index(ext, "?"); idx != -1 {
+		ext = ext[:idx]
+	}
+
+	return fileExtensions[ext]
 }
 
 func isStaticFile(path string) bool {
@@ -670,4 +719,34 @@ func contains(slice []string, item string) bool {
 		}
 	}
 	return false
+}
+func (s *Scanner) analyzeResponse(url, body string) {
+	found := []string{}
+
+	for name, pattern := range sensitivePatterns {
+		matches := pattern.FindAllString(body, 3)
+		if len(matches) > 0 {
+			found = append(found, fmt.Sprintf("%s: %v", name, matches))
+		}
+	}
+
+	if len(found) > 0 {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		f, err := os.OpenFile("secrets_found.txt", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			s.logVerbose("Failed to open secrets_found.txt: %v", err)
+			return
+		}
+		defer f.Close()
+
+		f.WriteString(fmt.Sprintf("URL: %s\n", url))
+		for _, line := range found {
+			f.WriteString("  " + line + "\n")
+		}
+		f.WriteString(strings.Repeat("-", 40) + "\n")
+
+		fmt.Printf("\n[!] Sensitive data found at %s\n", url)
+	}
 }
