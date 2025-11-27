@@ -10,7 +10,6 @@
 - Combo mode: sequential scan & browser crawl with deduplication
 - Sensitive data analysis (keys, tokens, emails, secrets)
 - BFS auto-crawl for deeper exploration
-- SOCKS5 proxy support for IP rotation and anti-ban
 - Custom user-agent & flexible rate limiting
 - Interactive and CLI flag-driven configuration
 - Result deduplication, export to txt
