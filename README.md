@@ -29,3 +29,5 @@ GoScope — Многофункциональный веб-сканер для п
 - Подмена user-agent и гибкие настройки скорости
 - Интерактивная и CLI-конфигурация
 - Дедупликация результатов и экспорт в txt
+
+[RECOMMENDATION](https://github.com/porgnope/goscope/blob/main/README.recommendation.md)
